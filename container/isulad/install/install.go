@@ -12,16 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The install package registers all included container providers when imported
+// The install package registers isulad.NewPlugin() as the "isulad" container provider when imported
 package install
 
 import (
-	// Register all included container providers.
-	_ "github.com/google/cadvisor/cmd/internal/container/mesos/install"
-	_ "github.com/google/cadvisor/container/containerd/install"
-	_ "github.com/google/cadvisor/container/crio/install"
-	_ "github.com/google/cadvisor/container/docker/install"
-	_ "github.com/google/cadvisor/container/isulad/install"
-	_ "github.com/google/cadvisor/container/podman/install"
-	_ "github.com/google/cadvisor/container/systemd/install"
+	"k8s.io/klog/v2"
+
+	"github.com/google/cadvisor/container"
+	iSulad "github.com/google/cadvisor/container/isulad"
 )
+
+func init() {
+	err := container.RegisterPlugin("iSuald", iSulad.NewPlugin())
+	if err != nil {
+		klog.Fatalf("Failed to register iSulad plugin: %v", err)
+	}
+}
