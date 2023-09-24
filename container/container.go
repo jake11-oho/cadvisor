@@ -35,6 +35,7 @@ const (
 	ContainerTypeCrio
 	ContainerTypeContainerd
 	ContainerTypeMesos
+	ContainerTypeIsulad
 )
 
 // Interface for container operation handlers.
