@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All Rights Reserved.
+// Copyright 2023 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,16 +17,14 @@ package isulad
 import (
 	"context"
 	"fmt"
-
-	containersapi "github.com/google/cadvisor/third_party/isulad/api/services/containers"
 )
 
 type isuladClientMock struct {
-	cntrs     map[string]*containersapi.Container
+	cntrs     map[string]*ContainerJSON
 	returnErr error
 }
 
-func (c *isuladClientMock) LoadContainer(ctx context.Context, id string) (*containersapi.Container, error) {
+func (c *isuladClientMock) InspectContainer(ctx context.Context, id string) (*ContainerJSON, error) {
 	if c.returnErr != nil {
 		return nil, c.returnErr
 	}
@@ -41,7 +39,7 @@ func (c *isuladClientMock) Version(ctx context.Context) (string, error) {
 	return "test-v0.0.0", nil
 }
 
-func mockIsuladClient(cntrs map[string]*containersapi.Container, returnErr error) IsuladClient {
+func mockIsuladClient(cntrs map[string]*ContainerJSON, returnErr error) IsuladClient {
 	return &isuladClientMock{
 		cntrs:     cntrs,
 		returnErr: returnErr,

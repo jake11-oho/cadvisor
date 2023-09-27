@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All Rights Reserved.
+// Copyright 2023 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,6 +33,8 @@ import (
 
 var ArgIsuladEndpoint = flag.String("isulad", "/var/run/isulad.sock", "isulad endpoint")
 
+var isuladEnvMetadataWhiteList = flag.String("isulad_env_metadata_whitelist", "", "DEPRECATED: this flag will be removed, please use `env_metadata_whitelist`. A comma-separated list of environment variable keys matched with specified prefix that needs to be collected for isulad containers")
+
 const isuladNamespace = "isulad"
 
 // Regexp that identifies isulad cgroups, containers started with
@@ -51,13 +53,20 @@ type isuladFactory struct {
 }
 
 func (f *isuladFactory) String() string {
-	return "isulad"
+	return isuladNamespace
 }
 
 func (f *isuladFactory) NewContainerHandler(name string, metadataEnvAllowList []string, inHostNamespace bool) (handler container.ContainerHandler, err error) {
 	client, err := Client(*ArgIsuladEndpoint)
 	if err != nil {
 		return
+	}
+
+	isuladMetadataEnvAllowList := strings.Split(*isuladEnvMetadataWhiteList, ",")
+
+	// prefer using the unified metadataEnvAllowList
+	if len(metadataEnvAllowList) != 0 {
+		isuladMetadataEnvAllowList = metadataEnvAllowList
 	}
 
 	return newIsuladContainerHandler(
@@ -67,6 +76,7 @@ func (f *isuladFactory) NewContainerHandler(name string, metadataEnvAllowList []
 		f.fsInfo,
 		f.cgroupSubsystems,
 		inHostNamespace,
+		isuladMetadataEnvAllowList,
 		f.includedMetrics,
 	)
 }
@@ -83,7 +93,6 @@ func ContainerNameToIsuladID(name string) string {
 // isContainerName returns true if the cgroup with associated name
 // corresponds to a isulad container.
 func isContainerName(name string) bool {
-	// TODO: May be check with HasPrefix IsuladNamespace
 	if strings.HasSuffix(name, ".mount") {
 		return false
 	}
@@ -101,8 +110,8 @@ func (f *isuladFactory) CanHandleAndAccept(name string) (bool, bool, error) {
 	// If container and task lookup in isulad fails then we assume
 	// that the container state is not known to isulad
 	ctx := context.Background()
-	_, err := f.client.LoadContainer(ctx, id)
-	if err != nil {
+	cont, err := f.client.InspectContainer(ctx, id)
+	if err != nil || !cont.State.Running {
 		return false, false, fmt.Errorf("failed to load container: %v", err)
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All Rights Reserved.
+// Copyright 2023 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package isulad
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"golang.org/x/net/context"
@@ -37,10 +38,14 @@ type isuladContainerHandler struct {
 	// Metadata associated with the container.
 	reference info.ContainerReference
 	envs      map[string]string
+	labels    map[string]string
 	// Image name used for this container.
 	image string
 	// Filesystem handler.
 	includedMetrics container.MetricSet
+
+	// The IP address of the container
+	ipAddress string
 
 	libcontainerHandler *containerlibcontainer.Handler
 }
@@ -55,6 +60,7 @@ func newIsuladContainerHandler(
 	fsInfo fs.FsInfo,
 	cgroupSubsystems map[string]string,
 	inHostNamespace bool,
+	metadataEnvAllowList []string,
 	includedMetrics container.MetricSet,
 ) (container.ContainerHandler, error) {
 	// Create the cgroup paths.
@@ -66,19 +72,17 @@ func newIsuladContainerHandler(
 		return nil, err
 	}
 
-	id := ContainerNameToIsuladID(name)
-	// We assume that if load fails then the container is not known to isulad.
-	ctx := context.Background()
-	cntr, err := client.LoadContainer(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
-	taskPid := cntr.Pid
-
 	rootfs := "/"
 	if !inHostNamespace {
 		rootfs = "/rootfs"
+	}
+
+	id := ContainerNameToIsuladID(name)
+
+	// We assume that if load fails then the container is not known to isulad.
+	cntr, err := client.InspectContainer(context.Background(), id)
+	if err != nil {
+		return nil, err
 	}
 
 	containerReference := info.ContainerReference{
@@ -88,19 +92,55 @@ func newIsuladContainerHandler(
 		Aliases:   []string{id, name},
 	}
 
-	libcontainerHandler := containerlibcontainer.NewHandler(cgroupManager, rootfs, int(taskPid), includedMetrics)
+	// Do not report network metrics for containers that share netns with another container.
+	metrics := common.RemoveNetMetrics(includedMetrics, strings.HasPrefix(cntr.HostConfig.NetworkMode, "container:"))
+
+	libcontainerHandler := containerlibcontainer.NewHandler(cgroupManager, rootfs, int(cntr.State.Pid), includedMetrics)
 
 	handler := &isuladContainerHandler{
 		machineInfoFactory:  machineInfoFactory,
 		cgroupPaths:         cgroupPaths,
 		fsInfo:              fsInfo,
 		envs:                make(map[string]string),
-		includedMetrics:     includedMetrics,
+		labels:              cntr.Config.Labels,
+		includedMetrics:     metrics,
 		reference:           containerReference,
 		libcontainerHandler: libcontainerHandler,
 	}
 	// Add the name and bare ID as aliases of the container.
-	handler.image = cntr.Image
+	handler.image = cntr.Config.Image
+
+	// Obtain the IP address for the container.
+	// If the NetworkMode starts with 'container:' then we need to use the IP address of the container specified.
+	// This happens in cases such as kubernetes where the containers doesn't have an IP address itself and we need to use the pod's address
+	ipAddress := cntr.NetworkSettings.IPAddress
+	networkMode := string(cntr.HostConfig.NetworkMode)
+	if ipAddress == "" && strings.HasPrefix(networkMode, "container:") {
+		containerID := strings.TrimPrefix(networkMode, "container:")
+		c, err := client.InspectContainer(context.Background(), containerID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect container %q: %v", id, err)
+		}
+		ipAddress = c.NetworkSettings.IPAddress
+	}
+
+	handler.ipAddress = ipAddress
+
+	for _, exposedEnv := range metadataEnvAllowList {
+		if exposedEnv == "" {
+			// if no containerdEnvWhitelist provided, len(metadataEnvAllowList) == 1, metadataEnvAllowList[0] == ""
+			continue
+		}
+
+		for _, envVar := range cntr.Config.Env {
+			if envVar != "" {
+				splits := strings.SplitN(envVar, "=", 2)
+				if len(splits) == 2 && strings.HasPrefix(splits[0], exposedEnv) {
+					handler.envs[splits[0]] = splits[1]
+				}
+			}
+		}
+	}
 
 	return handler, nil
 }
@@ -115,6 +155,7 @@ func (h *isuladContainerHandler) GetSpec() (info.ContainerSpec, error) {
 	hasFilesystem := false
 	hasNet := h.includedMetrics.Has(container.NetworkUsageMetrics)
 	spec, err := common.GetSpec(h.cgroupPaths, h.machineInfoFactory, hasNet, hasFilesystem)
+	spec.Labels = h.labels
 	spec.Envs = h.envs
 	spec.Image = h.image
 
@@ -161,7 +202,7 @@ func (h *isuladContainerHandler) GetCgroupPath(resource string) (string, error) 
 }
 
 func (h *isuladContainerHandler) GetContainerLabels() map[string]string {
-	return map[string]string{}
+	return h.labels
 }
 
 func (h *isuladContainerHandler) ListProcesses(listType container.ListType) ([]int, error) {
@@ -183,5 +224,5 @@ func (h *isuladContainerHandler) Cleanup() {
 }
 
 func (h *isuladContainerHandler) GetContainerIPAddress() string {
-	return ""
+	return h.ipAddress
 }

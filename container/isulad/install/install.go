@@ -1,4 +1,4 @@
-// Copyright 2019 Google Inc. All Rights Reserved.
+// Copyright 2023 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,12 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/google/cadvisor/container"
-	iSulad "github.com/google/cadvisor/container/isulad"
+	isulad "github.com/google/cadvisor/container/isulad"
 )
 
 func init() {
-	err := container.RegisterPlugin("iSuald", iSulad.NewPlugin())
+	err := container.RegisterPlugin("isuald", isulad.NewPlugin())
 	if err != nil {
-		klog.Fatalf("Failed to register iSulad plugin: %v", err)
+		klog.Fatalf("Failed to register isulad plugin: %v", err)
 	}
 }

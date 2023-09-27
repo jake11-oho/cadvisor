@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All Rights Reserved.
+// Copyright 2023 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package isulad
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -36,7 +37,7 @@ type client struct {
 }
 
 type IsuladClient interface {
-	LoadContainer(ctx context.Context, id string) (*containersapi.Container, error)
+	InspectContainer(ctx context.Context, id string) (*ContainerJSON, error)
 	Version(ctx context.Context) (string, error)
 }
 
@@ -92,56 +93,28 @@ func Client(address string) (IsuladClient, error) {
 	return ctrdClient, retErr
 }
 
-type contextKey string
-
-func (c contextKey) String() string {
-	return "isulad context key " + string(c)
-}
-
-const tlsModeKey = contextKey("tls_mode")
-
-func (c *client) LoadContainer(ctx context.Context, id string) (*containersapi.Container, error) {
-	ctx = context.WithValue(ctx, tlsModeKey, "0")
-	r, err := c.containerService.List(ctx, &containersapi.ListRequest{
-		Filters: map[string]string{
-			"id": id,
-		},
-		All: false,
+func (c *client) InspectContainer(ctx context.Context, id string) (*ContainerJSON, error) {
+	const timeout int32 = 120
+	r, err := c.containerService.Inspect(ctx, &containersapi.InspectContainerRequest{
+		Id:      id,
+		Bformat: false,
+		Timeout: timeout,
 	})
-	if err != nil || len(r.Containers) == 0 {
+	if err != nil {
 		return nil, errdefs.FromGRPC(err)
 	}
-	return containerFromProto(*r.Containers[0]), nil
+	var container ContainerJSON
+	err = json.Unmarshal([]byte(r.ContainerJSON), &container)
+	if err != nil {
+		return nil, err
+	}
+	return &container, nil
 }
 
 func (c *client) Version(ctx context.Context) (string, error) {
-	ctx = context.WithValue(ctx, tlsModeKey, "0")
 	response, err := c.containerService.Version(ctx, &containersapi.VersionRequest{})
 	if err != nil {
 		return "", errdefs.FromGRPC(err)
 	}
 	return response.Version, nil
-}
-
-func containerFromProto(containerpb containersapi.Container) *containersapi.Container {
-	return &containersapi.Container{
-		Id:           containerpb.Id,
-		Pid:          containerpb.Pid,
-		Status:       containerpb.Status,
-		Interface:    containerpb.Interface,
-		Ipv4:         containerpb.Ipv4,
-		Ipv6:         containerpb.Ipv6,
-		Image:        containerpb.Image,
-		Command:      containerpb.Command,
-		Ram:          containerpb.Ram,
-		Swap:         containerpb.Swap,
-		ExitCode:     containerpb.ExitCode,
-		Restartcount: containerpb.Restartcount,
-		Startat:      containerpb.Startat,
-		Finishat:     containerpb.Finishat,
-		Runtime:      containerpb.Runtime,
-		Name:         containerpb.Name,
-		HealthState:  containerpb.HealthState,
-		Created:      containerpb.Created,
-	}
 }

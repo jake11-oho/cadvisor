@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All Rights Reserved.
+// Copyright 2023 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ package isulad
 import (
 	"testing"
 
-	containersapi "github.com/google/cadvisor/third_party/isulad/api/services/containers"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -44,8 +43,8 @@ func TestIsContainerName(t *testing.T) {
 
 func TestCanHandleAndAccept(t *testing.T) {
 	as := assert.New(t)
-	testContainers := make(map[string]*containersapi.Container)
-	testContainer := &containersapi.Container{
+	testContainers := make(map[string]*ContainerJSON)
+	testContainer := &ContainerJSON{
 		Id: "40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9",
 	}
 	testContainers["40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9"] = testContainer
