@@ -17,14 +17,16 @@ package isulad
 import (
 	"context"
 	"fmt"
+
+	dockertypes "github.com/docker/docker/api/types"
 )
 
 type isuladClientMock struct {
-	cntrs     map[string]*ContainerJSON
+	cntrs     map[string]*dockertypes.ContainerJSON
 	returnErr error
 }
 
-func (c *isuladClientMock) InspectContainer(ctx context.Context, id string) (*ContainerJSON, error) {
+func (c *isuladClientMock) InspectContainer(ctx context.Context, id string) (*dockertypes.ContainerJSON, error) {
 	if c.returnErr != nil {
 		return nil, c.returnErr
 	}
@@ -39,9 +41,8 @@ func (c *isuladClientMock) Version(ctx context.Context) (string, error) {
 	return "test-v0.0.0", nil
 }
 
-func mockIsuladClient(cntrs map[string]*ContainerJSON, returnErr error) IsuladClient {
-	return &isuladClientMock{
-		cntrs:     cntrs,
-		returnErr: returnErr,
-	}
+func (c *isuladClientMock) Info(ctx context.Context) (*dockertypes.Info, error) {
+	return &dockertypes.Info{
+		ID: "test-id",
+	}, nil
 }

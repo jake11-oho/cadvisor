@@ -1,4 +1,4 @@
-// Copyright 2023 Google Inc. All Rights Reserved.
+// Copyright 2017 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package isulad
 import (
 	"testing"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -26,7 +27,7 @@ func TestIsContainerName(t *testing.T) {
 		expected bool
 	}{
 		{
-			name:     "/isulad/14ae50f1d3ada102aec3ab00168fdafb2dc0986d79ca9e8d5b75581fa89e9fea-rootfs.mount",
+			name:     "/system.slice/run-containerd-io.containerd.runtime.v1.linux-k8s.io-14ae50f1d3ada102aec3ab00168fdafb2dc0986d79ca9e8d5b75581fa89e9fea-rootfs.mount",
 			expected: false,
 		},
 		{
@@ -43,22 +44,30 @@ func TestIsContainerName(t *testing.T) {
 
 func TestCanHandleAndAccept(t *testing.T) {
 	as := assert.New(t)
-	testContainers := make(map[string]*ContainerJSON)
-	testContainer := &ContainerJSON{
-		Id: "40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9",
+	testContainers := make(map[string]*dockertypes.ContainerJSON)
+	testContainer := &dockertypes.ContainerJSON{
+		ContainerJSONBase: &dockertypes.ContainerJSONBase{
+			ID: "40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9",
+			State: &dockertypes.ContainerState{
+				Running: true,
+			},
+		},
 	}
 	testContainers["40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9"] = testContainer
 
 	f := &isuladFactory{
-		client:             mockIsuladClient(testContainers, nil),
+		client: &isuladClientMock{
+			cntrs:     testContainers,
+			returnErr: nil,
+		},
 		cgroupSubsystems:   nil,
 		fsInfo:             nil,
 		machineInfoFactory: nil,
 		includedMetrics:    nil,
 	}
 	for k, v := range map[string]bool{
-		"/isulad/40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9":              true,
-		"/isulad/14ae50f1d3ada102aec3ab00168fdafb2dc0986d79ca9e8d5b75581fa89e9fea-rootfs.mount": false,
+		"/isulad/40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9":                                                                         true,
+		"/system.slice/run-containerd-io.containerd.runtime.v1.linux-k8s.io-14ae50f1d3ada102aec3ab00168fdafb2dc0986d79ca9e8d5b75581fa89e9fea-rootfs.mount": false,
 	} {
 		b1, b2, err := f.CanHandleAndAccept(k)
 		as.Nil(err)

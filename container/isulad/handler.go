@@ -17,14 +17,19 @@ package isulad
 
 import (
 	"fmt"
+	"path"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"golang.org/x/net/context"
 
 	"github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/container/common"
+	"github.com/google/cadvisor/container/docker"
 	containerlibcontainer "github.com/google/cadvisor/container/libcontainer"
+	"github.com/google/cadvisor/devicemapper"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
 )
@@ -34,18 +39,30 @@ type isuladContainerHandler struct {
 	// Absolute path to the cgroup hierarchies of this container.
 	// (e.g.: "cpu" -> "/sys/fs/cgroup/cpu/test")
 	cgroupPaths map[string]string
-	fsInfo      fs.FsInfo
+
+	storageDriver    docker.StorageDriver
+	fsInfo           fs.FsInfo
+	rootfsStorageDir string
+
+	creationTime time.Time
+
 	// Metadata associated with the container.
 	reference info.ContainerReference
 	envs      map[string]string
 	labels    map[string]string
+
 	// Image name used for this container.
 	image string
+
 	// Filesystem handler.
-	includedMetrics container.MetricSet
+	fsHandler common.FsHandler
 
 	// The IP address of the container
 	ipAddress string
+
+	includedMetrics container.MetricSet
+
+	thinPoolName string
 
 	libcontainerHandler *containerlibcontainer.Handler
 }
@@ -58,10 +75,14 @@ func newIsuladContainerHandler(
 	name string,
 	machineInfoFactory info.MachineInfoFactory,
 	fsInfo fs.FsInfo,
+	storageDriver docker.StorageDriver,
+	storageDir string,
 	cgroupSubsystems map[string]string,
 	inHostNamespace bool,
 	metadataEnvAllowList []string,
 	includedMetrics container.MetricSet,
+	thinPoolName string,
+	thinPoolWatcher *devicemapper.ThinPoolWatcher,
 ) (container.ContainerHandler, error) {
 	// Create the cgroup paths.
 	cgroupPaths := common.MakeCgroupPaths(cgroupSubsystems, name)
@@ -75,6 +96,7 @@ func newIsuladContainerHandler(
 	rootfs := "/"
 	if !inHostNamespace {
 		rootfs = "/rootfs"
+		storageDir = path.Join(rootfs, storageDir)
 	}
 
 	id := ContainerNameToIsuladID(name)
@@ -85,30 +107,51 @@ func newIsuladContainerHandler(
 		return nil, err
 	}
 
-	containerReference := info.ContainerReference{
-		Id:        id,
-		Name:      name,
-		Namespace: isuladNamespace,
-		Aliases:   []string{id, name},
+	// Do not report network metrics for containers that share netns with another container.
+	metrics := common.RemoveNetMetrics(includedMetrics, cntr.HostConfig.NetworkMode.IsContainer())
+
+	rwLayerID, err := rwLayerID(storageDriver, storageDir, id)
+	if err != nil {
+		return nil, err
 	}
 
-	// Do not report network metrics for containers that share netns with another container.
-	metrics := common.RemoveNetMetrics(includedMetrics, strings.HasPrefix(cntr.HostConfig.NetworkMode, "container:"))
+	// rootfs storagedir of overlay and overlay2 both under .../overlay/<rwLayerID>/diff
+	var rootfsStorageDir string
+	if storageDriver == docker.OverlayStorageDriver || storageDriver == docker.Overlay2StorageDriver {
+		rootfsStorageDir = path.Join(storageDir, "storage", "overlay", rwLayerID, "diff")
+	}
 
-	libcontainerHandler := containerlibcontainer.NewHandler(cgroupManager, rootfs, int(cntr.State.Pid), includedMetrics)
+	otherStorageDir := filepath.Join(storageDir, "storage", string(storageDriver)+"-containers", id)
 
 	handler := &isuladContainerHandler{
-		machineInfoFactory:  machineInfoFactory,
-		cgroupPaths:         cgroupPaths,
-		fsInfo:              fsInfo,
-		envs:                make(map[string]string),
-		labels:              cntr.Config.Labels,
-		includedMetrics:     metrics,
-		reference:           containerReference,
-		libcontainerHandler: libcontainerHandler,
+		machineInfoFactory: machineInfoFactory,
+		cgroupPaths:        cgroupPaths,
+		storageDriver:      storageDriver,
+		fsInfo:             fsInfo,
+		rootfsStorageDir:   rootfsStorageDir,
+		envs:               make(map[string]string),
+		labels:             cntr.Config.Labels,
+		image:              cntr.Config.Image,
+		includedMetrics:    metrics,
+		thinPoolName:       thinPoolName,
+		fsHandler:          common.NewFsHandler(common.DefaultPeriod, rootfsStorageDir, otherStorageDir, fsInfo),
+		reference: info.ContainerReference{
+			Id:        id,
+			Name:      name,
+			Namespace: isuladNamespace,
+			Aliases:   []string{id, name},
+		},
+		libcontainerHandler: containerlibcontainer.NewHandler(cgroupManager, rootfs, int(cntr.State.Pid), includedMetrics),
 	}
-	// Add the name and bare ID as aliases of the container.
-	handler.image = cntr.Config.Image
+
+	handler.creationTime, err = time.Parse(time.RFC3339, cntr.Created)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse the create timestamp %q for container %q: %v", cntr.Created, id, err)
+	}
+
+	if cntr.RestartCount > 0 {
+		handler.labels["restartcount"] = fmt.Sprintf("%d", cntr.RestartCount)
+	}
 
 	// Obtain the IP address for the container.
 	// If the NetworkMode starts with 'container:' then we need to use the IP address of the container specified.
@@ -125,6 +168,14 @@ func newIsuladContainerHandler(
 	}
 
 	handler.ipAddress = ipAddress
+
+	if metrics.Has(container.DiskUsageMetrics) {
+		handler.fsHandler = &docker.FsHandler{
+			FsHandler:       common.NewFsHandler(common.DefaultPeriod, rootfsStorageDir, otherStorageDir, fsInfo),
+			ThinPoolWatcher: thinPoolWatcher,
+			DeviceID:        cntr.GraphDriver.Data["DeviceId"],
+		}
+	}
 
 	for _, exposedEnv := range metadataEnvAllowList {
 		if exposedEnv == "" {
@@ -150,28 +201,15 @@ func (h *isuladContainerHandler) ContainerReference() (info.ContainerReference, 
 }
 
 func (h *isuladContainerHandler) GetSpec() (info.ContainerSpec, error) {
-	// TODO: Since we dont collect disk usage stats for isulad, we set hasFilesystem
-	// to false. Revisit when we support disk usage stats for isulad.
-	hasFilesystem := false
+	hasFilesystem := h.includedMetrics.Has(container.DiskUsageMetrics)
 	hasNet := h.includedMetrics.Has(container.NetworkUsageMetrics)
 	spec, err := common.GetSpec(h.cgroupPaths, h.machineInfoFactory, hasNet, hasFilesystem)
 	spec.Labels = h.labels
 	spec.Envs = h.envs
 	spec.Image = h.image
+	spec.CreationTime = h.creationTime
 
 	return spec, err
-}
-
-func (h *isuladContainerHandler) getFsStats(stats *info.ContainerStats) error {
-	mi, err := h.machineInfoFactory.GetMachineInfo()
-	if err != nil {
-		return err
-	}
-
-	if h.includedMetrics.Has(container.DiskIOMetrics) {
-		common.AssignDeviceNamesToDiskStats((*common.MachineInfoNamer)(mi), &stats.DiskIo)
-	}
-	return nil
 }
 
 func (h *isuladContainerHandler) GetStats() (*info.ContainerStats, error) {
@@ -180,9 +218,17 @@ func (h *isuladContainerHandler) GetStats() (*info.ContainerStats, error) {
 		return stats, err
 	}
 
-	// Get filesystem stats.
-	err = h.getFsStats(stats)
-	return stats, err
+	if !h.includedMetrics.Has(container.NetworkUsageMetrics) {
+		stats.Network = info.NetworkStats{}
+	}
+
+	err = docker.FsStats(stats, h.machineInfoFactory, h.includedMetrics, h.storageDriver,
+		h.fsHandler, h.fsInfo, h.thinPoolName, h.rootfsStorageDir, "")
+	if err != nil {
+		return stats, err
+	}
+
+	return stats, nil
 }
 
 func (h *isuladContainerHandler) ListContainers(listType container.ListType) ([]info.ContainerReference, error) {
@@ -218,9 +264,15 @@ func (h *isuladContainerHandler) Type() container.ContainerType {
 }
 
 func (h *isuladContainerHandler) Start() {
+	if h.fsHandler != nil {
+		h.fsHandler.Start()
+	}
 }
 
 func (h *isuladContainerHandler) Cleanup() {
+	if h.fsHandler != nil {
+		h.fsHandler.Stop()
+	}
 }
 
 func (h *isuladContainerHandler) GetContainerIPAddress() string {

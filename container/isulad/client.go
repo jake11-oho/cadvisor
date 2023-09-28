@@ -17,9 +17,9 @@ package isulad
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,26 +27,28 @@ import (
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials/insecure"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/google/cadvisor/container/containerd/errdefs"
 	"github.com/google/cadvisor/container/containerd/pkg/dialer"
 	containersapi "github.com/google/cadvisor/third_party/isulad/api/services/containers"
+	imagesapi "github.com/google/cadvisor/third_party/isulad/api/services/images"
 )
 
 type client struct {
 	containerService containersapi.ContainerServiceClient
+	imageService     imagesapi.ImagesServiceClient
 }
 
 type IsuladClient interface {
-	InspectContainer(ctx context.Context, id string) (*ContainerJSON, error)
+	InspectContainer(ctx context.Context, id string) (*dockertypes.ContainerJSON, error)
 	Version(ctx context.Context) (string, error)
+	Info(ctx context.Context) (*dockertypes.Info, error)
 }
-
-var (
-	ErrTaskIsInUnknownState = errors.New("isulad task is in unknown state") // used when process reported in isulad task is in Unknown State
-)
 
 var once sync.Once
 var ctrdClient IsuladClient = nil
+
+var isuladTimeout int32 = 120
 
 const (
 	maxBackoffDelay   = 3 * time.Second
@@ -56,10 +58,10 @@ const (
 )
 
 // Client creates a containerd client
-func Client(address string) (IsuladClient, error) {
+func Client() (IsuladClient, error) {
 	var retErr error
 	once.Do(func() {
-		tryConn, err := net.DialTimeout("unix", address, connectionTimeout)
+		tryConn, err := net.DialTimeout("unix", *ArgIsuladEndpoint, connectionTimeout)
 		if err != nil {
 			retErr = fmt.Errorf("isulad: cannot unix dial isulad api service: %v", err)
 			return
@@ -81,29 +83,29 @@ func Client(address string) (IsuladClient, error) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
 		defer cancel()
-		conn, err := grpc.DialContext(ctx, dialer.DialAddress(address), gopts...)
+		conn, err := grpc.DialContext(ctx, dialer.DialAddress(*ArgIsuladEndpoint), gopts...)
 		if err != nil {
 			retErr = err
 			return
 		}
 		ctrdClient = &client{
 			containerService: containersapi.NewContainerServiceClient(conn),
+			imageService:     imagesapi.NewImagesServiceClient(conn),
 		}
 	})
 	return ctrdClient, retErr
 }
 
-func (c *client) InspectContainer(ctx context.Context, id string) (*ContainerJSON, error) {
-	const timeout int32 = 120
+func (c *client) InspectContainer(ctx context.Context, id string) (*dockertypes.ContainerJSON, error) {
 	r, err := c.containerService.Inspect(ctx, &containersapi.InspectContainerRequest{
 		Id:      id,
 		Bformat: false,
-		Timeout: timeout,
+		Timeout: isuladTimeout,
 	})
 	if err != nil {
 		return nil, errdefs.FromGRPC(err)
 	}
-	var container ContainerJSON
+	var container dockertypes.ContainerJSON
 	err = json.Unmarshal([]byte(r.ContainerJSON), &container)
 	if err != nil {
 		return nil, err
@@ -117,4 +119,42 @@ func (c *client) Version(ctx context.Context) (string, error) {
 		return "", errdefs.FromGRPC(err)
 	}
 	return response.Version, nil
+}
+
+func (c *client) Info(ctx context.Context) (*dockertypes.Info, error) {
+	response, err := c.containerService.Info(ctx, &containersapi.InfoRequest{})
+	if err != nil {
+		return nil, errdefs.FromGRPC(err)
+	}
+
+	var driverStatus [][2]string
+	for _, v := range strings.Split(response.DriverStatus, "\n") {
+		if v != "" {
+			s := strings.Split(v, ":")
+			if len(s) == 2 {
+				driverStatus = append(driverStatus, [2]string{s[0], strings.TrimSpace(s[1])})
+			}
+		}
+	}
+	return &dockertypes.Info{
+		Containers:        int(response.ContainersNum),
+		ContainersRunning: int(response.CRunning),
+		ContainersPaused:  int(response.CPaused),
+		ContainersStopped: int(response.CStopped),
+		Images:            int(response.ImagesNum),
+		Driver:            response.DriverName,
+		DriverStatus:      driverStatus,
+		LoggingDriver:     response.LoggingDriver,
+		CgroupDriver:      response.CgroupDriver,
+		KernelVersion:     response.Kversion,
+		OperatingSystem:   response.OperatingSystem,
+		OSType:            response.OsType,
+		Architecture:      response.Architecture,
+		NCPU:              int(response.Cpus),
+		MemTotal:          int64(response.TotalMem),
+		DockerRootDir:     response.IsuladRootDir,
+		HTTPProxy:         response.HttpProxy,
+		HTTPSProxy:        response.HttpsProxy,
+		NoProxy:           response.NoProxy,
+	}, nil
 }

@@ -20,36 +20,75 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/net/context"
 	"k8s.io/klog/v2"
 
 	"github.com/google/cadvisor/container"
+	"github.com/google/cadvisor/container/docker"
+	dockerutil "github.com/google/cadvisor/container/docker/utils"
 	"github.com/google/cadvisor/container/libcontainer"
+	"github.com/google/cadvisor/devicemapper"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/watcher"
 )
 
+const (
+	rootDirRetries     = 5
+	rootDirRetryPeriod = time.Second
+)
+
 var ArgIsuladEndpoint = flag.String("isulad", "/var/run/isulad.sock", "isulad endpoint")
 
-var isuladEnvMetadataWhiteList = flag.String("isulad_env_metadata_whitelist", "", "DEPRECATED: this flag will be removed, please use `env_metadata_whitelist`. A comma-separated list of environment variable keys matched with specified prefix that needs to be collected for isulad containers")
-
 const isuladNamespace = "isulad"
+
+var (
+	rootDir     string
+	rootDirOnce sync.Once
+)
 
 // Regexp that identifies isulad cgroups, containers started with
 // --cgroup-parent have another prefix than 'isulad'
 var isuladCgroupRegexp = regexp.MustCompile(`([a-z0-9]{64})`)
 
+func RootDir() string {
+	rootDirOnce.Do(func() {
+		for i := 0; i < rootDirRetries; i++ {
+			client, err := Client()
+			if err != nil {
+				klog.Errorf("failed to create isulad client: %v", err)
+				break
+			}
+			in, err := client.Info(context.Background())
+			if err == nil && in.DockerRootDir != "" {
+				rootDir = in.DockerRootDir
+				break
+			} else {
+				time.Sleep(rootDirRetryPeriod)
+			}
+		}
+	})
+	return rootDir
+}
+
 type isuladFactory struct {
 	machineInfoFactory info.MachineInfoFactory
-	client             IsuladClient
-	version            string
+
+	storageDriver docker.StorageDriver
+	storageDir    string
+
+	client IsuladClient
 	// Information about the mounted cgroup subsystems.
 	cgroupSubsystems map[string]string
 	// Information about mounted filesystems.
 	fsInfo          fs.FsInfo
 	includedMetrics container.MetricSet
+
+	thinPoolName    string
+	thinPoolWatcher *devicemapper.ThinPoolWatcher
 }
 
 func (f *isuladFactory) String() string {
@@ -57,16 +96,9 @@ func (f *isuladFactory) String() string {
 }
 
 func (f *isuladFactory) NewContainerHandler(name string, metadataEnvAllowList []string, inHostNamespace bool) (handler container.ContainerHandler, err error) {
-	client, err := Client(*ArgIsuladEndpoint)
+	client, err := Client()
 	if err != nil {
 		return
-	}
-
-	isuladMetadataEnvAllowList := strings.Split(*isuladEnvMetadataWhiteList, ",")
-
-	// prefer using the unified metadataEnvAllowList
-	if len(metadataEnvAllowList) != 0 {
-		isuladMetadataEnvAllowList = metadataEnvAllowList
 	}
 
 	return newIsuladContainerHandler(
@@ -74,10 +106,14 @@ func (f *isuladFactory) NewContainerHandler(name string, metadataEnvAllowList []
 		name,
 		f.machineInfoFactory,
 		f.fsInfo,
+		f.storageDriver,
+		f.storageDir,
 		f.cgroupSubsystems,
 		inHostNamespace,
-		isuladMetadataEnvAllowList,
+		metadataEnvAllowList,
 		f.includedMetrics,
+		f.thinPoolName,
+		f.thinPoolWatcher,
 	)
 }
 
@@ -109,8 +145,7 @@ func (f *isuladFactory) CanHandleAndAccept(name string) (bool, bool, error) {
 	id := ContainerNameToIsuladID(name)
 	// If container and task lookup in isulad fails then we assume
 	// that the container state is not known to isulad
-	ctx := context.Background()
-	cont, err := f.client.InspectContainer(ctx, id)
+	cont, err := f.client.InspectContainer(context.Background(), id)
 	if err != nil || !cont.State.Running {
 		return false, false, fmt.Errorf("failed to load container: %v", err)
 	}
@@ -124,14 +159,17 @@ func (f *isuladFactory) DebugInfo() map[string][]string {
 
 // Register root container before running this function!
 func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, includedMetrics container.MetricSet) error {
-	client, err := Client(*ArgIsuladEndpoint)
+	c, err := Client()
 	if err != nil {
 		return fmt.Errorf("unable to create isulad client: %v", err)
 	}
 
-	isuladVersion, err := client.Version(context.Background())
+	in, err := c.Info(context.Background())
 	if err != nil {
-		return fmt.Errorf("failed to fetch isulad client version: %v", err)
+		return err
+	}
+	if in.Driver == "" {
+		return fmt.Errorf("isulad driver is not set")
 	}
 
 	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems(includedMetrics)
@@ -139,14 +177,32 @@ func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, includedMetrics
 		return fmt.Errorf("failed to get cgroup subsystems: %v", err)
 	}
 
+	var (
+		thinPoolName    string
+		thinPoolWatcher *devicemapper.ThinPoolWatcher
+	)
+	if includedMetrics.Has(container.DiskUsageMetrics) &&
+		docker.StorageDriver(in.Driver) == docker.DevicemapperStorageDriver {
+		thinPoolWatcher, err = docker.StartThinPoolWatcher(in)
+		if err != nil {
+			klog.Errorf("devicemapper filesystem stats will not be reported: %v", err)
+		}
+
+		status, _ := docker.StatusFromDockerInfo(*in)
+		thinPoolName = status.DriverStatus[dockerutil.DriverStatusPoolName]
+	}
+
 	klog.V(1).Infof("Registering isulad factory")
 	f := &isuladFactory{
 		cgroupSubsystems:   cgroupSubsystems,
-		client:             client,
+		storageDriver:      docker.StorageDriver(in.Driver),
+		storageDir:         RootDir(),
+		client:             c,
 		fsInfo:             fsInfo,
 		machineInfoFactory: factory,
-		version:            isuladVersion,
 		includedMetrics:    includedMetrics,
+		thinPoolName:       thinPoolName,
+		thinPoolWatcher:    thinPoolWatcher,
 	}
 
 	container.RegisterContainerHandlerFactory(f, []watcher.ContainerWatchSource{watcher.Raw})
