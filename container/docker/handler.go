@@ -58,7 +58,7 @@ type dockerContainerHandler struct {
 	cgroupPaths map[string]string
 
 	// the docker storage driver
-	storageDriver    storageDriver
+	storageDriver    StorageDriver
 	fsInfo           fs.FsInfo
 	rootfsStorageDir string
 
@@ -97,7 +97,7 @@ type dockerContainerHandler struct {
 
 var _ container.ContainerHandler = &dockerContainerHandler{}
 
-func getRwLayerID(containerID, storageDir string, sd storageDriver, dockerVersion []int) (string, error) {
+func getRwLayerID(containerID, storageDir string, sd StorageDriver, dockerVersion []int) (string, error) {
 	const (
 		// Docker version >=1.10.0 have a randomized ID for the root fs of a container.
 		randomizedRWLayerMinorVersion = 10
@@ -120,7 +120,7 @@ func newDockerContainerHandler(
 	name string,
 	machineInfoFactory info.MachineInfoFactory,
 	fsInfo fs.FsInfo,
-	storageDriver storageDriver,
+	storageDriver StorageDriver,
 	storageDir string,
 	cgroupSubsystems map[string]string,
 	inHostNamespace bool,
@@ -165,15 +165,15 @@ func newDockerContainerHandler(
 		zfsParent        string
 	)
 	switch storageDriver {
-	case aufsStorageDriver:
-		rootfsStorageDir = path.Join(storageDir, string(aufsStorageDriver), aufsRWLayer, rwLayerID)
-	case overlayStorageDriver:
+	case AufsStorageDriver:
+		rootfsStorageDir = path.Join(storageDir, string(AufsStorageDriver), aufsRWLayer, rwLayerID)
+	case OverlayStorageDriver:
 		rootfsStorageDir = path.Join(storageDir, string(storageDriver), rwLayerID, overlayRWLayer)
-	case overlay2StorageDriver:
+	case Overlay2StorageDriver:
 		rootfsStorageDir = path.Join(storageDir, string(storageDriver), rwLayerID, overlay2RWLayer)
-	case vfsStorageDriver:
+	case VfsStorageDriver:
 		rootfsStorageDir = path.Join(storageDir)
-	case zfsStorageDriver:
+	case ZfsStorageDriver:
 		status, err := Status()
 		if err != nil {
 			return nil, fmt.Errorf("unable to determine docker status: %v", err)
@@ -378,17 +378,17 @@ func (h *dockerContainerHandler) getFsStats(stats *info.ContainerStats) error {
 	}
 	var device string
 	switch h.storageDriver {
-	case devicemapperStorageDriver:
+	case DevicemapperStorageDriver:
 		// Device has to be the pool name to correlate with the device name as
 		// set in the machine info filesystems.
 		device = h.poolName
-	case aufsStorageDriver, overlayStorageDriver, overlay2StorageDriver, vfsStorageDriver:
+	case AufsStorageDriver, OverlayStorageDriver, Overlay2StorageDriver, VfsStorageDriver:
 		deviceInfo, err := h.fsInfo.GetDirFsDevice(h.rootfsStorageDir)
 		if err != nil {
 			return fmt.Errorf("unable to determine device info for dir: %v: %v", h.rootfsStorageDir, err)
 		}
 		device = deviceInfo.Device
-	case zfsStorageDriver:
+	case ZfsStorageDriver:
 		device = h.zfsParent
 	default:
 		return nil
